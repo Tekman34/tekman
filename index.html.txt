@@ -1,0 +1,942 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, doc, setDoc, getDoc, onSnapshot, updateDoc } from 'firebase/firestore';
+
+// --- CONFIGURATION MANAGER ---
+
+// 1. Try to get config from the Environment (Artifact)
+// 2. If not found, try LocalStorage (User's deployed version)
+// 3. If neither, return null to trigger Setup Screen
+const getStoredConfig = () => {
+    // Environment Variable Check (For Artifact Preview)
+    if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+        try {
+            return typeof __firebase_config === 'string' ? JSON.parse(__firebase_config) : __firebase_config;
+        } catch (e) { console.error("Env Config Parse Error", e); }
+    }
+    
+    // LocalStorage Check (For Deployed/Local Version)
+    const local = localStorage.getItem('qr_firebase_config');
+    if (local) {
+        try { return JSON.parse(local); } catch (e) { return null; }
+    }
+    return null;
+};
+
+const getStoredAppId = () => {
+    if (typeof __app_id !== 'undefined') return __app_id;
+    return localStorage.getItem('qr_app_id') || 'default-app-id';
+};
+
+const getStoredApiKey = () => {
+    // Note: In Artifact, key is injected at runtime for fetch, not stored in var usually
+    // But for deployed version, user needs to provide it.
+    return localStorage.getItem('qr_gemini_key') || "";
+};
+
+// --- GLOBAL VARS ---
+let app, auth, db;
+const initialConfig = getStoredConfig();
+
+if (initialConfig) {
+    try {
+        app = initializeApp(initialConfig);
+        auth = getAuth(app);
+        db = getFirestore(app);
+    } catch (e) {
+        console.error("Firebase Init Error", e);
+    }
+}
+
+// Helper to generate 6-digit PIN
+const generatePin = () => Math.floor(100000 + Math.random() * 900000).toString();
+
+// --- DEFAULT QUESTIONS ---
+const DEFAULT_QUESTIONS = [
+    {
+        question: "Quelle est la capitale de la France ?",
+        options: ["Lyon", "Marseille", "Paris", "Bordeaux"],
+        correct: 2,
+        time: 20
+    },
+    {
+        question: "Qui a écrit 'Les Misérables' ?",
+        options: ["Molière", "Victor Hugo", "Émile Zola", "Albert Camus"],
+        correct: 1,
+        time: 20
+    },
+    {
+        question: "En quelle année la Révolution française a-t-elle commencé ?",
+        options: ["1789", "1799", "1804", "1776"],
+        correct: 0,
+        time: 20
+    }
+];
+
+// --- COMPONENTS ---
+
+export default function App() {
+    const [config, setConfig] = useState(initialConfig);
+    const [user, setUser] = useState(null);
+    const [mode, setMode] = useState('home'); // setup, home, host, player
+    
+    // Auth Initialization
+    useEffect(() => {
+        if (!auth) return; // Wait for config
+
+        const initAuth = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Auth Error:", error);
+            }
+        };
+        initAuth();
+        const unsubscribe = onAuthStateChanged(auth, (u) => setUser(u));
+        return () => unsubscribe();
+    }, [config]);
+
+    // Tailwind Injection Fallback
+    useEffect(() => {
+        if (!document.getElementById('tailwind-script')) {
+            const script = document.createElement('script');
+            script.src = "https://cdn.tailwindcss.com";
+            script.id = 'tailwind-script';
+            document.head.appendChild(script);
+        }
+    }, []);
+
+    // Handle Config Save
+    const handleSaveConfig = (newConfigStr, newApiKey) => {
+        try {
+            const parsed = JSON.parse(newConfigStr);
+            localStorage.setItem('qr_firebase_config', JSON.stringify(parsed));
+            if (newApiKey) localStorage.setItem('qr_gemini_key', newApiKey);
+            
+            // Force reload to init firebase
+            window.location.reload();
+        } catch (e) {
+            alert("Erreur de format JSON. Vérifiez votre configuration.");
+        }
+    };
+
+    // Reset Config
+    const handleReset = () => {
+        if(confirm("Réinitialiser la configuration ?")) {
+            localStorage.removeItem('qr_firebase_config');
+            localStorage.removeItem('qr_gemini_key');
+            window.location.reload();
+        }
+    }
+
+    // Global Styles
+    const GlobalStyles = () => (
+        <style>{`
+            @import url('https://fonts.googleapis.com/css2?family=Fredoka:wght@300;400;600;700&display=swap');
+            @import url('https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css');
+            
+            body {
+                font-family: 'Fredoka', sans-serif;
+                background-color: #46178f;
+                color: white;
+                margin: 0;
+            }
+            .glass-panel {
+                background: rgba(255, 255, 255, 0.1);
+                backdrop-filter: blur(10px);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+            }
+            .animate-pop {
+                animation: pop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            }
+            @keyframes pop {
+                0% { transform: scale(0.5); opacity: 0; }
+                100% { transform: scale(1); opacity: 1; }
+            }
+        `}</style>
+    );
+
+    if (!config) return <SetupView onSave={handleSaveConfig} />;
+    
+    if (!user) return (
+        <div className="h-screen flex items-center justify-center bg-purple-900 text-white">
+            <GlobalStyles />
+            <i className="fas fa-circle-notch fa-spin text-4xl"></i>
+        </div>
+    );
+
+    return (
+        <>
+            <GlobalStyles />
+            <div className="fixed top-2 right-2 z-50">
+                 <button onClick={handleReset} className="text-xs text-white/30 hover:text-white/80">Reset Config</button>
+            </div>
+            {mode === 'home' && <HomeView setMode={setMode} />}
+            {mode === 'host' && <HostView user={user} onBack={() => setMode('home')} db={db} appId={getStoredAppId()} apiKey={getStoredApiKey()} />}
+            {mode === 'player' && <PlayerView user={user} onBack={() => setMode('home')} db={db} appId={getStoredAppId()} />}
+        </>
+    );
+}
+
+// 0. SETUP VIEW (For Deployment)
+function SetupView({ onSave }) {
+    const [json, setJson] = useState('');
+    const [key, setKey] = useState('');
+
+    return (
+        <div className="min-h-screen flex flex-col items-center justify-center p-6 bg-slate-900 text-white">
+            <h1 className="text-4xl font-bold mb-4 text-yellow-400">Configuration Requise</h1>
+            <p className="mb-8 text-center max-w-md text-gray-300">
+                Pour utiliser ce jeu en dehors de l'aperçu, vous devez connecter votre propre base de données Firebase.
+            </p>
+            
+            <div className="w-full max-w-md space-y-4">
+                <div>
+                    <label className="block mb-2 font-bold">1. Configuration Firebase (JSON)</label>
+                    <textarea 
+                        className="w-full h-40 bg-black/30 border border-white/20 rounded p-3 text-xs font-mono"
+                        placeholder='{"apiKey": "...", "authDomain": "...", ...}'
+                        value={json}
+                        onChange={e => setJson(e.target.value)}
+                    />
+                    <a href="https://console.firebase.google.com" target="_blank" className="text-xs text-blue-400 hover:underline">Créer un projet Firebase gratuit →</a>
+                </div>
+
+                <div>
+                    <label className="block mb-2 font-bold">2. Clé API Gemini (Optionnel pour l'IA)</label>
+                    <input 
+                        type="text" 
+                        className="w-full bg-black/30 border border-white/20 rounded p-3"
+                        placeholder="AIzaSy..."
+                        value={key}
+                        onChange={e => setKey(e.target.value)}
+                    />
+                    <a href="https://aistudio.google.com/app/apikey" target="_blank" className="text-xs text-blue-400 hover:underline">Obtenir une clé Gemini →</a>
+                </div>
+
+                <button 
+                    onClick={() => onSave(json, key)}
+                    disabled={!json.includes('{')}
+                    className="w-full bg-green-600 hover:bg-green-500 py-3 rounded font-bold mt-4 disabled:opacity-50"
+                >
+                    Sauvegarder et Lancer
+                </button>
+            </div>
+        </div>
+    )
+}
+
+// 1. HOME VIEW
+function HomeView({ setMode }) {
+    return (
+        <div className="min-h-screen flex flex-col items-center justify-center p-4 relative overflow-hidden bg-gradient-to-br from-purple-900 to-blue-900">
+            <div className="absolute top-10 left-10 w-20 h-20 bg-red-500 rounded-full opacity-20 animate-bounce"></div>
+            <div className="absolute bottom-20 right-10 w-32 h-32 bg-yellow-400 rounded-lg rotate-12 opacity-20"></div>
+
+            <h1 className="text-6xl font-bold mb-2 text-white drop-shadow-lg tracking-wider text-center">
+                QUIZ<span className="text-yellow-400">RAPIDE</span>
+            </h1>
+            <p className="text-xl text-purple-200 mb-12 text-center">L'outil de présentation interactif</p>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-8 w-full max-w-2xl">
+                <button 
+                    onClick={() => setMode('player')}
+                    className="group relative bg-white text-purple-900 p-8 rounded-2xl shadow-2xl hover:scale-105 transition-all duration-200 text-left"
+                >
+                    <div className="absolute -top-4 -right-4 w-12 h-12 bg-green-400 rounded-full flex items-center justify-center text-white font-bold text-xl shadow-lg group-hover:rotate-12 transition">
+                        <i className="fas fa-play"></i>
+                    </div>
+                    <h2 className="text-3xl font-bold mb-2">Joueur</h2>
+                    <p className="text-gray-500">Rejoindre une partie existante</p>
+                </button>
+
+                <button 
+                    onClick={() => setMode('host')}
+                    className="group relative bg-purple-600 text-white p-8 rounded-2xl shadow-2xl hover:scale-105 transition-all duration-200 border-2 border-purple-400 text-left"
+                >
+                    <div className="absolute -top-4 -right-4 w-12 h-12 bg-yellow-400 rounded-full flex items-center justify-center text-purple-900 font-bold text-xl shadow-lg group-hover:rotate-12 transition">
+                        <i className="fas fa-crown"></i>
+                    </div>
+                    <h2 className="text-3xl font-bold mb-2">Hôte</h2>
+                    <p className="text-purple-200">Créer et animer un quiz</p>
+                </button>
+            </div>
+        </div>
+    );
+}
+
+// 2. HOST VIEW
+function HostView({ user, onBack, db, appId, apiKey }) {
+    const [gameId, setGameId] = useState(null);
+    const [gameState, setGameState] = useState(null);
+    const [players, setPlayers] = useState([]);
+    const [questions, setQuestions] = useState(DEFAULT_QUESTIONS);
+    const [editingQuestions, setEditingQuestions] = useState(false);
+    const [copied, setCopied] = useState(false);
+    
+    // AI State
+    const [showAiModal, setShowAiModal] = useState(false);
+    const [aiTopic, setAiTopic] = useState('');
+    const [isGenerating, setIsGenerating] = useState(false);
+
+    // Create Game
+    useEffect(() => {
+        const createGame = async () => {
+            const newPin = generatePin();
+            const gameRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', newPin);
+            
+            await setDoc(gameRef, {
+                hostId: user.uid,
+                pin: newPin,
+                status: 'lobby',
+                currentQuestionIndex: 0,
+                questionStartTimestamp: null,
+                questions: questions,
+                timestamp: Date.now()
+            });
+            setGameId(newPin);
+        };
+        if (!gameId) createGame();
+    }, []);
+
+    // Listen to Game & Players
+    useEffect(() => {
+        if (!gameId) return;
+
+        const gameUnsub = onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'games', gameId), (doc) => {
+            if (doc.exists()) setGameState(doc.data());
+        });
+
+        const playersUnsub = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', `games_${gameId}_players`), (snapshot) => {
+            const pList = [];
+            snapshot.forEach(doc => pList.push({ id: doc.id, ...doc.data() }));
+            setPlayers(pList.sort((a, b) => b.score - a.score));
+        });
+
+        return () => {
+            gameUnsub();
+            playersUnsub();
+        };
+    }, [gameId]);
+
+    // ACTIONS
+    const updateQuestions = async (newQuestions) => {
+        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'games', gameId), {
+            questions: newQuestions
+        });
+        setQuestions(newQuestions);
+        setEditingQuestions(false);
+    };
+
+    const generateWithGemini = async () => {
+        if (!aiTopic.trim()) return;
+        setIsGenerating(true);
+
+        // Use injected key or stored key
+        const effectiveKey = (typeof __google_search_api_key !== 'undefined' ? "" : "") || apiKey; 
+        // NOTE: In preview, we don't need a key if proxy handles it, but for deployed we do.
+        // Since we cannot rely on proxy in deployment, we use the key passed in props.
+
+        try {
+            const prompt = `Génère 5 questions de quiz à choix multiples amusantes et compétitives sur le thème : "${aiTopic}". 
+            Langue: Français.
+            Format JSON strict : un tableau d'objets.
+            Chaque objet doit avoir :
+            - "question" (string)
+            - "options" (tableau de 4 strings)
+            - "correct" (index entier 0-3 de la bonne réponse)
+            - "time" (entier 20)
+            Réponds UNIQUEMENT le JSON brut, sans markdown.`;
+
+            // Determine URL: If local proxy exists (preview), use it. If not, use direct API with key.
+            // For this artifact, we assume direct API with user key for portability.
+            if (!effectiveKey && !window.location.href.includes('usercontent')) {
+                alert("Clé API manquante. Veuillez l'ajouter dans la configuration.");
+                setIsGenerating(false);
+                return;
+            }
+
+            // Note: In this specific preview environment, the key is injected securely by the backend proxy 
+            // so the fetch URL includes 'key=${apiKey}' where apiKey might be empty string but handled by proxy.
+            // However, for a deployed app, you MUST use the real key.
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${effectiveKey}`;
+
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{ parts: [{ text: prompt }] }],
+                    generationConfig: { responseMimeType: "application/json" }
+                })
+            });
+
+            if (!response.ok) throw new Error('API Error');
+
+            const data = await response.json();
+            const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            const aiQuestions = JSON.parse(text);
+
+            if (Array.isArray(aiQuestions)) {
+                await updateQuestions(aiQuestions);
+                setShowAiModal(false);
+                setAiTopic('');
+            }
+        } catch (error) {
+            console.error("AI Generation failed:", error);
+            alert("Erreur lors de la génération. Vérifiez votre clé API.");
+        } finally {
+            setIsGenerating(false);
+        }
+    };
+
+    const startGame = async () => {
+        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'games', gameId), {
+            status: 'countdown',
+            currentQuestionIndex: 0
+        });
+        
+        setTimeout(async () => {
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'games', gameId), {
+                status: 'question',
+                questionStartTimestamp: Date.now()
+            });
+        }, 3000);
+    };
+
+    const copyLink = () => {
+        // Copy current URL
+        navigator.clipboard.writeText(window.location.href);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+    };
+
+    const nextStep = async () => {
+        if (!gameState) return;
+        const gameRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', gameId);
+        
+        if (gameState.status === 'question') {
+            await updateDoc(gameRef, { status: 'result' });
+        } else if (gameState.status === 'result') {
+            await updateDoc(gameRef, { status: 'leaderboard' });
+        } else if (gameState.status === 'leaderboard') {
+            const nextIdx = gameState.currentQuestionIndex + 1;
+            if (nextIdx < gameState.questions.length) {
+                await updateDoc(gameRef, {
+                    status: 'question',
+                    currentQuestionIndex: nextIdx,
+                    questionStartTimestamp: Date.now()
+                });
+            } else {
+                await updateDoc(gameRef, { status: 'end' });
+            }
+        }
+    };
+
+    if (!gameId || !gameState) return <div className="p-10 text-center text-white">Création de la salle...</div>;
+
+    // --- HOST VIEWS ---
+
+    // LOBBY
+    if (gameState.status === 'lobby') {
+        return (
+            <div className="min-h-screen flex flex-col items-center bg-slate-900 p-6 text-white">
+                {/* AI Modal */}
+                {showAiModal && (
+                    <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 backdrop-blur-sm animate-pop">
+                        <div className="bg-gradient-to-br from-purple-900 to-indigo-900 p-8 rounded-2xl w-full max-w-lg border border-purple-500/50 shadow-2xl">
+                            <h2 className="text-3xl font-bold mb-6 text-center flex items-center justify-center">
+                                <span className="mr-3 text-4xl">✨</span> Générateur IA
+                            </h2>
+                            
+                            <div className="mb-6">
+                                <label className="block text-purple-200 mb-2 text-lg">Quel est le thème du quiz ?</label>
+                                <input 
+                                    type="text"
+                                    value={aiTopic}
+                                    onChange={(e) => setAiTopic(e.target.value)}
+                                    placeholder="ex: Le cinéma des années 80, Les fromages..."
+                                    className="w-full p-4 rounded-xl bg-black/30 border-2 border-purple-500/30 focus:border-yellow-400 outline-none text-white text-lg placeholder-purple-400/50"
+                                    onKeyDown={(e) => e.key === 'Enter' && generateWithGemini()}
+                                />
+                            </div>
+
+                            <div className="flex gap-3">
+                                <button 
+                                    onClick={() => setShowAiModal(false)}
+                                    className="flex-1 py-3 rounded-xl font-bold text-purple-300 hover:bg-white/5 transition"
+                                    disabled={isGenerating}
+                                >
+                                    Annuler
+                                </button>
+                                <button 
+                                    onClick={generateWithGemini}
+                                    disabled={isGenerating || !aiTopic.trim()}
+                                    className="flex-1 bg-gradient-to-r from-yellow-400 to-orange-500 text-purple-900 py-3 rounded-xl font-bold text-lg hover:scale-105 transition-transform disabled:opacity-50 disabled:scale-100 flex items-center justify-center"
+                                >
+                                    {isGenerating ? <i className="fas fa-circle-notch fa-spin mr-2"></i> : <><i className="fas fa-magic mr-2"></i> Générer</>}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {editingQuestions && (
+                    <div className="fixed inset-0 bg-black bg-opacity-90 z-50 flex items-center justify-center p-4">
+                        <div className="bg-white text-black p-6 rounded-lg w-full max-w-3xl h-3/4 overflow-y-auto">
+                            <h2 className="text-2xl font-bold mb-4">Éditer les Questions (JSON)</h2>
+                            <textarea 
+                                className="w-full h-64 border p-2 font-mono text-sm"
+                                defaultValue={JSON.stringify(questions, null, 2)}
+                                id="jsonInput"
+                            ></textarea>
+                            <div className="mt-4 flex justify-end gap-2">
+                                <button onClick={() => setEditingQuestions(false)} className="px-4 py-2 bg-gray-200 rounded">Annuler</button>
+                                <button onClick={() => {
+                                    try {
+                                        const val = document.getElementById('jsonInput').value;
+                                        updateQuestions(JSON.parse(val));
+                                    } catch(e) { alert("Erreur JSON invalid"); }
+                                }} className="px-4 py-2 bg-blue-600 text-white rounded">Sauvegarder</button>
+                            </div>
+                            <p className="text-sm text-gray-500 mt-2">Format: [{`{"question": "...", "options": ["A","B","C","D"], "correct": 0, "time": 20}`}]</p>
+                        </div>
+                    </div>
+                )}
+
+                <div className="w-full max-w-6xl flex justify-between items-start mb-8">
+                    <button onClick={onBack} className="text-white opacity-50 hover:opacity-100"><i className="fas fa-arrow-left"></i> Quitter</button>
+                    <div className="flex flex-col items-center animate-pop">
+                        <span className="text-gray-400 text-xl uppercase tracking-widest mb-2">Rejoindre avec le PIN :</span>
+                        <div className="flex items-center gap-4">
+                            <span className="text-8xl font-black text-white bg-white/10 px-8 py-2 rounded-xl border-2 border-white/20 shadow-[0_0_30px_rgba(255,255,255,0.3)]">
+                                {gameState.pin}
+                            </span>
+                            <button onClick={copyLink} className="bg-white/10 w-16 h-16 rounded-full flex items-center justify-center hover:bg-white/20 transition relative">
+                                <i className={`fas ${copied ? 'fa-check text-green-400' : 'fa-link'} text-2xl`}></i>
+                                {copied && <span className="absolute -bottom-8 text-xs text-green-400">Copié!</span>}
+                            </button>
+                        </div>
+                    </div>
+                    <div className="flex flex-col gap-2">
+                        <button onClick={() => setShowAiModal(true)} className="px-6 py-3 bg-gradient-to-r from-indigo-500 to-purple-600 rounded-lg text-white hover:brightness-110 shadow-lg border border-white/20 font-bold">
+                            <i className="fas fa-sparkles mr-2 text-yellow-300"></i> Générer IA
+                        </button>
+                        <button onClick={() => setEditingQuestions(true)} className="px-6 py-2 bg-white/10 rounded-lg text-white hover:bg-white/20 text-sm">
+                            <i className="fas fa-pencil-alt mr-2"></i> Manuel ({questions.length})
+                        </button>
+                    </div>
+                </div>
+
+                <div className="flex-1 w-full max-w-6xl bg-black/20 rounded-3xl p-8 border border-white/10 backdrop-blur-sm">
+                    <div className="flex justify-between items-center mb-6">
+                        <h2 className="text-2xl font-bold"><i className="fas fa-users mr-2"></i> Joueurs ({players.length})</h2>
+                        <button 
+                            onClick={startGame}
+                            disabled={players.length === 0}
+                            className={`px-8 py-4 rounded-xl font-bold text-2xl shadow-lg transition transform hover:scale-105 ${players.length === 0 ? 'bg-gray-600 cursor-not-allowed' : 'bg-green-500 hover:bg-green-400'}`}
+                        >
+                            Commencer
+                        </button>
+                    </div>
+                    
+                    {players.length === 0 ? (
+                        <div className="text-center py-20 opacity-50">
+                            <i className="fas fa-spinner fa-spin text-4xl mb-4"></i>
+                            <p>En attente de joueurs...</p>
+                        </div>
+                    ) : (
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            {players.map(p => (
+                                <div key={p.id} className="bg-white text-slate-900 p-4 rounded-xl font-bold text-lg flex items-center animate-pop shadow-lg">
+                                    <div className="w-10 h-10 rounded-full bg-purple-100 flex items-center justify-center mr-3 text-2xl">
+                                        {p.avatar || '👾'}
+                                    </div>
+                                    {p.name}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            </div>
+        );
+    }
+
+    // COUNTDOWN
+    if (gameState.status === 'countdown') {
+            return (
+            <div className="h-screen flex flex-col items-center justify-center bg-purple-900">
+                    <h1 className="text-9xl font-bold text-white animate-bounce">PRÊT ?</h1>
+            </div>
+            );
+    }
+
+    const currentQ = gameState.questions[gameState.currentQuestionIndex];
+
+    // QUESTION
+    if (gameState.status === 'question') {
+        return (
+            <div className="h-screen flex flex-col bg-slate-900 text-white p-4">
+                <div className="flex justify-between items-center mb-4 opacity-70">
+                    <span className="bg-white/10 px-4 py-1 rounded-full">{gameState.currentQuestionIndex + 1} / {gameState.questions.length}</span>
+                    <Timer duration={currentQ.time} onComplete={nextStep} />
+                </div>
+
+                <div className="flex-1 flex flex-col items-center justify-center mb-8 text-center">
+                    <h1 className="text-4xl md:text-6xl font-bold mb-12 drop-shadow-lg max-w-4xl leading-tight">
+                        {currentQ.question}
+                    </h1>
+                    
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-5xl h-64">
+                        {currentQ.options.map((opt, idx) => {
+                            const colors = ["bg-red-500", "bg-blue-500", "bg-yellow-500", "bg-green-500"];
+                            const shapes = ["▲", "◆", "●", "■"];
+                            return (
+                                <div key={idx} className={`${colors[idx]} rounded-xl flex items-center p-6 shadow-lg`}>
+                                    <span className="text-4xl mr-4 text-black/20">{shapes[idx]}</span>
+                                    <span className="text-2xl md:text-3xl font-bold text-white shadow-black drop-shadow-md">{opt}</span>
+                                </div>
+                            )
+                        })}
+                    </div>
+                </div>
+                
+                <div className="flex justify-between items-end px-8 pb-4">
+                    <div className="text-xl font-bold">{players.length} Réponses</div>
+                    <button onClick={nextStep} className="bg-white/20 hover:bg-white/30 px-6 py-2 rounded text-sm">Passer</button>
+                </div>
+            </div>
+        );
+    }
+
+    // RESULTS
+    if (gameState.status === 'result') {
+        const counts = [0,0,0,0];
+        players.forEach(p => {
+            if (p.lastAnswerIndex === gameState.currentQuestionIndex && p.lastAnswerChoice !== null && p.lastAnswerChoice !== undefined) {
+                counts[p.lastAnswerChoice]++;
+            }
+        });
+
+        return (
+            <div className="h-screen flex flex-col bg-slate-900 text-white p-6">
+                <h2 className="text-3xl font-bold text-center mb-8 opacity-80">{currentQ.question}</h2>
+                
+                <div className="flex-1 flex items-end justify-center gap-8 pb-20 px-10 max-w-5xl mx-auto w-full">
+                    {currentQ.options.map((opt, idx) => {
+                        const colors = ["bg-red-500", "bg-blue-500", "bg-yellow-500", "bg-green-500"];
+                        const isCorrect = idx === currentQ.correct;
+                        const maxVotes = Math.max(...counts, 1); 
+                        const height = counts[idx] === 0 ? '5%' : `${(counts[idx] / maxVotes) * 80 + 5}%`;
+                        
+                        return (
+                            <div key={idx} className="flex flex-col items-center w-1/4 h-full justify-end group">
+                                <div className="mb-4 text-2xl font-bold">{counts[idx]}</div>
+                                <div 
+                                    className={`${colors[idx]} w-full rounded-t-xl transition-all duration-1000 relative ${isCorrect ? 'opacity-100 ring-4 ring-white' : 'opacity-40'}`}
+                                    style={{height: height}}
+                                >
+                                    {isCorrect && <div className="absolute -top-10 left-1/2 transform -translate-x-1/2 text-4xl">✅</div>}
+                                </div>
+                                <div className="mt-4 h-12 w-full flex items-center justify-center text-center font-bold text-lg leading-tight">
+                                    {opt}
+                                </div>
+                            </div>
+                        )
+                    })}
+                </div>
+                <div className="flex justify-end">
+                    <button onClick={nextStep} className="bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-xl font-bold text-xl shadow-lg">
+                        Suivant <i className="fas fa-arrow-right ml-2"></i>
+                    </button>
+                </div>
+            </div>
+        )
+    }
+
+    // LEADERBOARD
+    if (gameState.status === 'leaderboard' || gameState.status === 'end') {
+        const top5 = players.slice(0, 5);
+        return (
+            <div className="h-screen flex flex-col bg-indigo-900 text-white p-6 overflow-hidden">
+                <h1 className="text-4xl font-bold text-center mb-8 text-yellow-400 uppercase tracking-widest">
+                    {gameState.status === 'end' ? 'Podium Final' : 'Classement'}
+                </h1>
+                
+                <div className="flex-1 flex flex-col items-center justify-center max-w-2xl mx-auto w-full space-y-4">
+                    {top5.map((p, idx) => (
+                        <div key={p.id} className="w-full bg-white text-indigo-900 rounded-xl p-4 flex items-center justify-between shadow-xl transform transition-all hover:scale-105 animate-pop" style={{animationDelay: `${idx * 100}ms`}}>
+                            <div className="flex items-center">
+                                <div className={`w-12 h-12 rounded-full flex items-center justify-center text-xl font-bold mr-4 ${idx === 0 ? 'bg-yellow-400 text-white' : idx === 1 ? 'bg-gray-300' : idx === 2 ? 'bg-orange-400 text-white' : 'bg-indigo-100'}`}>
+                                    {idx + 1}
+                                </div>
+                                <div>
+                                    <div className="font-bold text-xl">{p.name}</div>
+                                    {p.streak > 2 && <div className="text-xs text-orange-600 font-bold">🔥 Série de {p.streak} !</div>}
+                                </div>
+                            </div>
+                            <div className="text-2xl font-black">{p.score} pts</div>
+                        </div>
+                    ))}
+                </div>
+
+                <div className="flex justify-center mt-8">
+                        {gameState.status !== 'end' && (
+                        <button onClick={nextStep} className="bg-blue-600 hover:bg-blue-500 text-white px-10 py-4 rounded-xl font-bold text-xl shadow-lg">
+                            Question Suivante
+                        </button>
+                        )}
+                        {gameState.status === 'end' && (
+                        <button onClick={onBack} className="bg-gray-600 text-white px-6 py-2 rounded hover:bg-gray-500">Retour Accueil</button>
+                        )}
+                </div>
+            </div>
+        )
+    }
+
+    return <div>État inconnu</div>;
+}
+
+// 3. PLAYER VIEW
+function PlayerView({ user, onBack, db, appId }) {
+    const [pin, setPin] = useState('');
+    const [name, setName] = useState('');
+    const [joined, setJoined] = useState(false);
+    const [gameState, setGameState] = useState(null);
+    const [myPlayer, setMyPlayer] = useState(null);
+    const [submitted, setSubmitted] = useState(false);
+    const [feedback, setFeedback] = useState(null); // 'correct', 'wrong', null
+
+    const joinGame = async () => {
+        if (!pin || !name) return;
+        
+        // FIXED PATH
+        const gameRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', pin);
+        const gameSnap = await getDoc(gameRef);
+
+        if (!gameSnap.exists()) {
+            alert("Code PIN invalide !");
+            return;
+        }
+
+        const playerRef = doc(db, 'artifacts', appId, 'public', 'data', `games_${pin}_players`, user.uid);
+        await setDoc(playerRef, {
+            name: name,
+            score: 0,
+            streak: 0,
+            lastAnswerIndex: -1,
+            lastAnswerChoice: null,
+            avatar: ['🐶','🐱','🐭','🐹','🐰','🦊','🐻','🐼'][Math.floor(Math.random()*8)]
+        });
+
+        setJoined(true);
+    };
+
+    useEffect(() => {
+        if (!joined || !pin) return;
+
+        // FIXED PATH
+        const gameUnsub = onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'games', pin), (doc) => {
+            if (doc.exists()) {
+                const data = doc.data();
+                setGameState(prev => {
+                    if (prev && prev.currentQuestionIndex !== data.currentQuestionIndex && data.status === 'question') {
+                        setSubmitted(false);
+                        setFeedback(null);
+                    }
+                    return data;
+                });
+            } else {
+                alert("Le jeu a été fermé par l'hôte.");
+                setJoined(false);
+            }
+        });
+
+        const playerUnsub = onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', `games_${pin}_players`, user.uid), (doc) => {
+            if (doc.exists()) setMyPlayer(doc.data());
+        });
+
+        return () => {
+            gameUnsub();
+            playerUnsub();
+        }
+    }, [joined, pin]);
+
+    const submitAnswer = async (choiceIdx) => {
+        if (submitted || gameState.status !== 'question') return;
+        setSubmitted(true);
+
+        const currentQ = gameState.questions[gameState.currentQuestionIndex];
+        const isCorrect = choiceIdx === currentQ.correct;
+        
+        const timeTaken = (Date.now() - gameState.questionStartTimestamp) / 1000;
+        const maxTime = currentQ.time;
+        const scoreToAdd = isCorrect ? Math.max(500, Math.round(1000 * (1 - (timeTaken / (maxTime * 2))))) : 0;
+        
+        const playerRef = doc(db, 'artifacts', appId, 'public', 'data', `games_${pin}_players`, user.uid);
+        
+        const newStreak = isCorrect ? (myPlayer?.streak || 0) + 1 : 0;
+        const streakBonus = newStreak > 2 ? (newStreak * 100) : 0;
+        const totalPoints = isCorrect ? (scoreToAdd + streakBonus) : 0;
+
+        await updateDoc(playerRef, {
+            score: (myPlayer?.score || 0) + totalPoints,
+            streak: newStreak,
+            lastAnswerIndex: gameState.currentQuestionIndex,
+            lastAnswerChoice: choiceIdx
+        });
+
+        setFeedback(isCorrect ? 'correct' : 'wrong');
+    };
+
+    if (!joined) {
+        return (
+            <div className="min-h-screen bg-purple-800 flex items-center justify-center p-4">
+                <div className="bg-white rounded-2xl p-8 w-full max-w-md shadow-2xl text-center">
+                    <h2 className="text-2xl font-bold text-purple-900 mb-6">Rejoindre</h2>
+                    <input 
+                        type="number" 
+                        placeholder="Code PIN" 
+                        className="w-full text-center text-3xl font-bold tracking-widest border-2 border-gray-300 rounded-lg p-4 mb-4 focus:border-purple-500 outline-none text-black"
+                        value={pin}
+                        onChange={e => setPin(e.target.value)}
+                    />
+                    <input 
+                        type="text" 
+                        placeholder="Pseudo" 
+                        className="w-full text-center text-xl border-2 border-gray-300 rounded-lg p-4 mb-6 focus:border-purple-500 outline-none text-black"
+                        value={name}
+                        onChange={e => setName(e.target.value)}
+                    />
+                    <button 
+                        onClick={joinGame}
+                        className="w-full bg-purple-600 text-white font-bold text-xl py-4 rounded-lg hover:bg-purple-700 transition shadow-lg"
+                    >
+                        Entrer
+                    </button>
+                    <button onClick={onBack} className="mt-4 text-gray-500">Retour</button>
+                </div>
+            </div>
+        )
+    }
+
+    if (!gameState) return <div className="h-screen flex items-center justify-center text-white">Chargement...</div>;
+
+    // LOBBY
+    if (gameState.status === 'lobby') {
+        return (
+            <div className="h-screen bg-purple-700 flex flex-col items-center justify-center text-white p-6">
+                <div className="text-6xl mb-4 animate-bounce">{myPlayer?.avatar}</div>
+                <h2 className="text-3xl font-bold mb-2">Tu es dans la partie !</h2>
+                <p className="opacity-70">Vois-tu ton nom à l'écran ?</p>
+                <div className="mt-8 bg-purple-900 px-6 py-2 rounded-full">En attente de l'hôte...</div>
+            </div>
+        )
+    }
+
+    // COUNTDOWN
+    if (gameState.status === 'countdown') {
+        return (
+            <div className="h-screen bg-purple-900 flex items-center justify-center">
+                    <div className="w-16 h-16 border-4 border-white border-t-transparent rounded-full animate-spin"></div>
+            </div>
+        )
+    }
+
+    // QUESTION
+    if (gameState.status === 'question') {
+        if (submitted) {
+            return (
+                <div className="h-screen bg-indigo-900 flex flex-col items-center justify-center text-white p-6">
+                    <h2 className="text-3xl font-bold mb-4">Réponse envoyée !</h2>
+                    <div className="w-20 h-20 bg-white/10 rounded-full flex items-center justify-center animate-pulse">
+                        <i className="fas fa-hourglass-half text-3xl"></i>
+                    </div>
+                    <p className="mt-8 opacity-70">Attends les autres joueurs...</p>
+                </div>
+            )
+        }
+
+        return (
+            <div className="h-screen bg-slate-900 p-4 flex flex-col">
+                <div className="bg-slate-800 p-4 rounded-lg mb-4 flex justify-between items-center text-white">
+                    <span className="font-bold">Q{gameState.currentQuestionIndex + 1}</span>
+                    <span className="font-mono font-bold text-yellow-400">{myPlayer?.score} pts</span>
+                </div>
+                
+                <div className="flex-1 grid grid-cols-2 gap-4">
+                    {["▲", "◆", "●", "■"].map((shape, idx) => {
+                        const colors = ["bg-red-500", "bg-blue-500", "bg-yellow-500", "bg-green-500"];
+                        return (
+                            <button 
+                                key={idx}
+                                onClick={() => submitAnswer(idx)}
+                                className={`${colors[idx]} rounded-2xl flex items-center justify-center shadow-lg active:scale-95 transition-transform`}
+                            >
+                                <span className="text-6xl text-white drop-shadow-lg">{shape}</span>
+                            </button>
+                        )
+                    })}
+                </div>
+            </div>
+        )
+    }
+
+    // RESULT/LEADERBOARD
+    if (gameState.status === 'result' || gameState.status === 'leaderboard' || gameState.status === 'end') {
+        const isCorrect = feedback === 'correct';
+        const bgClass = isCorrect ? 'bg-green-500' : 'bg-red-500';
+        
+        if (gameState.status === 'result') {
+                return (
+                <div className={`h-screen ${bgClass} flex flex-col items-center justify-center text-white p-6 transition-colors duration-500`}>
+                    <div className="text-8xl mb-6 bg-white text-transparent bg-clip-text shadow-xl">
+                        {isCorrect ? <i className="fas fa-check text-white"></i> : <i className="fas fa-times text-white"></i>}
+                    </div>
+                    <h2 className="text-4xl font-black mb-2 uppercase">{isCorrect ? 'Correct !' : 'Faux...'}</h2>
+                    {isCorrect && <p className="text-xl font-bold bg-black/20 px-4 py-2 rounded-lg">+ Points</p>}
+                    <div className="mt-12 text-center">
+                        <p className="text-sm opacity-80 uppercase tracking-widest mb-1">Score actuel</p>
+                        <p className="text-4xl font-bold">{myPlayer?.score}</p>
+                    </div>
+                </div>
+            )
+        }
+
+        return (
+            <div className="h-screen bg-purple-900 text-white flex flex-col items-center justify-center">
+                <h2 className="text-2xl font-bold mb-4">Regarde le grand écran !</h2>
+                <div className="bg-purple-800 p-6 rounded-xl text-center w-64">
+                        <p className="text-gray-400 mb-2">Ta position</p>
+                        <p className="text-4xl font-bold">{myPlayer?.score} pts</p>
+                </div>
+            </div>
+        )
+    }
+
+    return <div>...</div>
+}
+
+// UTILS
+function Timer({ duration, onComplete }) {
+    const [timeLeft, setTimeLeft] = useState(duration);
+    
+    useEffect(() => {
+        if (timeLeft <= 0) {
+            onComplete();
+            return;
+        }
+        const timer = setInterval(() => setTimeLeft(t => t - 1), 1000);
+        return () => clearInterval(timer);
+    }, [timeLeft]);
+
+    return (
+        <div className="w-12 h-12 rounded-full bg-purple-600 flex items-center justify-center font-bold border-2 border-purple-400">
+            {timeLeft}
+        </div>
+    );
+}
